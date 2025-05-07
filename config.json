@@ -1,0 +1,9 @@
+{
+  "listen_addr": ":8080",
+  "proxies_file": "proxies.json",
+  "timeout": 10,
+  "worker_count": 100,
+  "metrics_addr": ":9090",
+  "check_interval": 30,
+  "max_idle_conns": 100
+}
