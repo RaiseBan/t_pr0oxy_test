@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,13 +32,17 @@ type ProxyServer struct {
 
 // NewProxyServer создает новый прокси сервер
 func NewProxyServer(config *Config, pm *ProxyManager, metrics *Metrics) *ProxyServer {
-	// Настраиваем транспорт с оптимизированными параметрами
+	// Настраиваем транспорт с отключенным keep-alive
 	transport := &http.Transport{
-		MaxIdleConns:        config.MaxIdleConns,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     60 * time.Second,
-		DisableCompression:  true,  // Отключаем сжатие для повышения производительности
-		DisableKeepAlives:   false, // Включаем Keep-Alive
+		MaxIdleConns:        0,    // Отключаем пул соединений
+		MaxIdleConnsPerHost: 0,    // Отключаем пул соединений
+		DisableCompression:  true, // Отключаем сжатие для повышения производительности
+		DisableKeepAlives:   true, // ВАЖНО: отключаем Keep-Alive
+		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: -1, // Отключаем TCP keep-alive
+		}).DialContext,
 	}
 
 	return &ProxyServer{
@@ -184,17 +189,37 @@ func (ps *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Добавляем заголовок для закрытия соединения после ответа
+	outReq.Header.Set("Connection", "close")
+	outReq.Close = true
+
 	// Настраиваем клиент с прокси
 	proxyURL, _ := url.Parse(proxy.URL)
-	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy:               http.ProxyURL(proxyURL),
-			MaxIdleConns:        ps.config.MaxIdleConns,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     60 * time.Second,
-		},
-		Timeout: time.Duration(ps.config.Timeout) * time.Second,
+
+	// Создаем транспорт с отключенным keep-alive
+	transport := &http.Transport{
+		Proxy:               http.ProxyURL(proxyURL),
+		MaxIdleConns:        0,    // Отключаем пул соединений
+		MaxIdleConnsPerHost: 0,    // Отключаем пул соединений
+		DisableKeepAlives:   true, // ВАЖНО: отключаем keep-alive
+		DisableCompression:  true, // Отключаем сжатие для производительности
+		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: -1, // Отключаем TCP keep-alive
+		}).DialContext,
 	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Duration(ps.config.Timeout) * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Не следуем за редиректами автоматически
+		},
+	}
+
+	// Убеждаемся, что транспорт будет закрыт
+	defer transport.CloseIdleConnections()
 
 	// Выполняем запрос
 	startTime := time.Now()
@@ -220,10 +245,24 @@ func (ps *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(name, value)
 		}
 	}
+
+	// Убеждаемся, что соединение будет закрыто
+	w.Header().Set("Connection", "close")
 	w.WriteHeader(resp.StatusCode)
 
 	// Копируем тело ответа
-	io.Copy(w, resp.Body)
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("Error copying response body: %v", err)
+	}
+
+	// Явное закрытие тела ответа
+	resp.Body.Close()
+
+	// Принудительное закрытие соединения для HTTP/1.1
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 // handleTunneling обрабатывает HTTPS запросы через туннелирование
