@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,17 +66,19 @@ func (m *Metrics) GetActiveConnections() int32 {
 	return atomic.LoadInt32(&m.ActiveConnections)
 }
 
-// RecordResponseTime записывает время ответа
+// RecordResponseTime записывает время ответа с ограничением размера
 func (m *Metrics) RecordResponseTime(duration time.Duration) {
 	m.responseTimesMutex.Lock()
 	defer m.responseTimesMutex.Unlock()
 
-	m.responseTimes = append(m.responseTimes, duration)
-
-	// Ограничиваем размер списка
-	if len(m.responseTimes) > m.maxResponseTimes {
-		m.responseTimes = m.responseTimes[1:]
+	// Если размер превышает лимит, удаляем старые записи
+	if len(m.responseTimes) >= m.maxResponseTimes {
+		// Удаляем 10% старых записей
+		removeCount := m.maxResponseTimes / 10
+		m.responseTimes = m.responseTimes[removeCount:]
 	}
+
+	m.responseTimes = append(m.responseTimes, duration)
 }
 
 // GetAverageResponseTime возвращает среднее время ответа в миллисекундах
@@ -94,13 +98,36 @@ func (m *Metrics) GetAverageResponseTime() float64 {
 	return float64(total.Milliseconds()) / float64(len(m.responseTimes))
 }
 
+// StartMemoryMonitor запускает мониторинг памяти
+func (m *Metrics) StartMemoryMonitor() {
+	ticker := time.NewTicker(30 * time.Second)
+	go func() {
+		for range ticker.C {
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+
+			log.Printf("Memory Stats - Alloc: %v MB, Sys: %v MB, NumGC: %v, Goroutines: %v",
+				ms.Alloc/1024/1024,
+				ms.Sys/1024/1024,
+				ms.NumGC,
+				runtime.NumGoroutine())
+		}
+	}()
+}
+
 // StartMetricsServer запускает HTTP-сервер для метрик
 func (m *Metrics) StartMetricsServer(addr string) {
+	// Запускаем мониторинг памяти
+	m.StartMemoryMonitor()
+
 	mux := http.NewServeMux()
 
 	// Эндпоинт для метрик в формате JSON
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
 
 		uptime := time.Since(m.StartTime)
 
@@ -114,6 +141,10 @@ func (m *Metrics) StartMetricsServer(addr string) {
 			"uptime_human":        formatUptime(uptime),
 			"requests_per_second": float64(atomic.LoadUint64(&m.TotalRequests)) / uptime.Seconds(),
 			"average_response_ms": m.GetAverageResponseTime(),
+			"memory_alloc_mb":     ms.Alloc / 1024 / 1024,
+			"memory_sys_mb":       ms.Sys / 1024 / 1024,
+			"num_goroutines":      runtime.NumGoroutine(),
+			"num_gc":              ms.NumGC,
 		}
 
 		// Добавляем информацию о доступных эндпоинтах

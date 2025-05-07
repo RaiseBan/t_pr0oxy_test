@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,37 +26,66 @@ var ENDPOINTS = map[string]string{
 
 // ProxyServer представляет HTTP-прокси сервер
 type ProxyServer struct {
-	config       *Config         // Конфигурация
-	proxyManager *ProxyManager   // Менеджер прокси
-	metrics      *Metrics        // Метрики
-	transport    *http.Transport // HTTP транспорт для повторного использования соединений
+	config        *Config       // Конфигурация
+	proxyManager  *ProxyManager // Менеджер прокси
+	metrics       *Metrics      // Метрики
+	transportPool sync.Map      // Пул транспортов для каждого прокси
 }
 
 // NewProxyServer создает новый прокси сервер
 func NewProxyServer(config *Config, pm *ProxyManager, metrics *Metrics) *ProxyServer {
-	// Настраиваем транспорт с отключенным keep-alive
-	transport := &http.Transport{
-		MaxIdleConns:        0,    // Отключаем пул соединений
-		MaxIdleConnsPerHost: 0,    // Отключаем пул соединений
-		DisableCompression:  true, // Отключаем сжатие для повышения производительности
-		DisableKeepAlives:   true, // ВАЖНО: отключаем Keep-Alive
-		TLSHandshakeTimeout: 10 * time.Second,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: -1, // Отключаем TCP keep-alive
-		}).DialContext,
-	}
-
 	return &ProxyServer{
 		config:       config,
 		proxyManager: pm,
 		metrics:      metrics,
-		transport:    transport,
 	}
+}
+
+// getTransport получает или создает транспорт для прокси
+func (ps *ProxyServer) getTransport(proxyURL string) *http.Transport {
+	if t, ok := ps.transportPool.Load(proxyURL); ok {
+		return t.(*http.Transport)
+	}
+
+	// Создаем новый транспорт только если его нет в пуле
+	parsedURL, _ := url.Parse(proxyURL)
+	transport := &http.Transport{
+		Proxy:               http.ProxyURL(parsedURL),
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		DisableKeepAlives:   false, // Включаем обратно для переиспользования
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+
+	ps.transportPool.Store(proxyURL, transport)
+	return transport
+}
+
+// startTransportCleaner запускает периодическую очистку транспортов
+func (ps *ProxyServer) startTransportCleaner() {
+	ticker := time.NewTicker(5 * time.Minute)
+	go func() {
+		for range ticker.C {
+			ps.transportPool.Range(func(key, value interface{}) bool {
+				transport := value.(*http.Transport)
+				transport.CloseIdleConnections()
+				return true
+			})
+			log.Printf("Transport pool cleaned. Goroutines: %d", runtime.NumGoroutine())
+		}
+	}()
 }
 
 // Start запускает прокси сервер
 func (ps *ProxyServer) Start() error {
+	// Запускаем периодическую очистку транспортов
+	ps.startTransportCleaner()
+
 	// Настраиваем HTTP-сервер
 	server := &http.Server{
 		Addr:    ps.config.ListenAddr,
@@ -146,10 +177,9 @@ func (ps *ProxyServer) parseTargetURL(path string) (string, error) {
 
 // handleHealthCheck обрабатывает запрос проверки работоспособности
 func (ps *ProxyServer) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
-	// Обратите внимание: мы НЕ проверяем прокси здесь
 	response := map[string]interface{}{
 		"status":         "ok",
-		"active_proxies": ps.proxyManager.GetTotalProxiesCount(), // считаем все прокси активными
+		"active_proxies": ps.proxyManager.GetTotalProxiesCount(),
 		"total_proxies":  ps.proxyManager.GetTotalProxiesCount(),
 		"endpoints":      make([]string, 0, len(ENDPOINTS)),
 	}
@@ -189,26 +219,8 @@ func (ps *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Добавляем заголовок для закрытия соединения после ответа
-	outReq.Header.Set("Connection", "close")
-	outReq.Close = true
-
-	// Настраиваем клиент с прокси
-	proxyURL, _ := url.Parse(proxy.URL)
-
-	// Создаем транспорт с отключенным keep-alive
-	transport := &http.Transport{
-		Proxy:               http.ProxyURL(proxyURL),
-		MaxIdleConns:        0,    // Отключаем пул соединений
-		MaxIdleConnsPerHost: 0,    // Отключаем пул соединений
-		DisableKeepAlives:   true, // ВАЖНО: отключаем keep-alive
-		DisableCompression:  true, // Отключаем сжатие для производительности
-		TLSHandshakeTimeout: 10 * time.Second,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: -1, // Отключаем TCP keep-alive
-		}).DialContext,
-	}
+	// Получаем транспорт из пула
+	transport := ps.getTransport(proxy.URL)
 
 	client := &http.Client{
 		Transport: transport,
@@ -218,9 +230,6 @@ func (ps *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Убеждаемся, что транспорт будет закрыт
-	defer transport.CloseIdleConnections()
-
 	// Выполняем запрос
 	startTime := time.Now()
 	resp, err := client.Do(outReq)
@@ -228,7 +237,6 @@ func (ps *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		ps.metrics.IncrementFailedRequests()
-		// Не помечаем прокси как неактивный - только увеличиваем счетчик ошибок
 		ps.proxyManager.IncrementProxyErrorCount(proxy.URL)
 		http.Error(w, fmt.Sprintf("Ошибка запроса: %v", err), http.StatusBadGateway)
 		return
@@ -245,23 +253,13 @@ func (ps *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(name, value)
 		}
 	}
-
-	// Убеждаемся, что соединение будет закрыто
-	w.Header().Set("Connection", "close")
 	w.WriteHeader(resp.StatusCode)
 
-	// Копируем тело ответа
-	_, err = io.Copy(w, resp.Body)
+	// Используем буферизованное копирование
+	buf := make([]byte, 32*1024) // 32KB буфер
+	_, err = io.CopyBuffer(w, resp.Body, buf)
 	if err != nil {
 		log.Printf("Error copying response body: %v", err)
-	}
-
-	// Явное закрытие тела ответа
-	resp.Body.Close()
-
-	// Принудительное закрытие соединения для HTTP/1.1
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
 	}
 }
 
@@ -287,11 +285,11 @@ func (ps *ProxyServer) handleTunneling(w http.ResponseWriter, r *http.Request) {
 	proxyConn, err := net.DialTimeout("tcp", proxyURL.Host, time.Duration(ps.config.Timeout)*time.Second)
 	if err != nil {
 		ps.metrics.IncrementFailedRequests()
-		// Увеличиваем счетчик ошибок, но не отключаем прокси
 		ps.proxyManager.IncrementProxyErrorCount(proxy.URL)
 		http.Error(w, fmt.Sprintf("Ошибка соединения с прокси: %v", err), http.StatusBadGateway)
 		return
 	}
+	defer proxyConn.Close()
 
 	// Если прокси использует HTTP Basic Auth
 	auth := ""
@@ -314,7 +312,6 @@ func (ps *ProxyServer) handleTunneling(w http.ResponseWriter, r *http.Request) {
 	n, err := proxyConn.Read(buffer)
 	if err != nil {
 		ps.metrics.IncrementFailedRequests()
-		// Увеличиваем счетчик ошибок, но не отключаем прокси
 		ps.proxyManager.IncrementProxyErrorCount(proxy.URL)
 		http.Error(w, fmt.Sprintf("Ошибка чтения ответа от прокси: %v", err), http.StatusBadGateway)
 		return
@@ -324,7 +321,6 @@ func (ps *ProxyServer) handleTunneling(w http.ResponseWriter, r *http.Request) {
 	response := string(buffer[:n])
 	if !strings.Contains(response, "200") {
 		ps.metrics.IncrementFailedRequests()
-		// Увеличиваем счетчик ошибок, но не отключаем прокси
 		ps.proxyManager.IncrementProxyErrorCount(proxy.URL)
 		http.Error(w, "Ошибка установки туннеля через прокси", http.StatusBadGateway)
 		return
@@ -345,19 +341,29 @@ func (ps *ProxyServer) handleTunneling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Теперь у нас есть два соединения: клиент <-> прокси сервер, прокси сервер <-> целевой сервер
-	// Просто передаем данные между ними
+	// Отправляем клиенту подтверждение соединения
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
 	ps.metrics.IncrementSuccessfulRequests()
 
-	go transfer(clientConn, proxyConn)
-	go transfer(proxyConn, clientConn)
-}
+	// Используем sync.WaitGroup для ожидания завершения горутин
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-// transfer копирует данные между двумя соединениями
-func transfer(dst, src net.Conn) {
-	defer dst.Close()
-	defer src.Close()
-	io.Copy(dst, src)
+	go func() {
+		defer wg.Done()
+		defer clientConn.Close()
+		io.Copy(clientConn, proxyConn)
+	}()
+
+	go func() {
+		defer wg.Done()
+		defer proxyConn.Close()
+		io.Copy(proxyConn, clientConn)
+	}()
+
+	// Ждем завершения обеих горутин
+	wg.Wait()
 }
 
 // basicAuth кодирует логин и пароль для Basic Authentication

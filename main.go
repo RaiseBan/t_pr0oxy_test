@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 )
@@ -39,6 +40,15 @@ func main() {
 
 	// Создаем прокси сервер
 	server := NewProxyServer(config, proxyManager, metrics)
+
+	// Запускаем периодическую сборку мусора
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		for range ticker.C {
+			runtime.GC()
+			log.Printf("Forced GC executed. Goroutines: %d", runtime.NumGoroutine())
+		}
+	}()
 
 	// Обрабатываем сигналы завершения
 	signalCh := make(chan os.Signal, 1)
