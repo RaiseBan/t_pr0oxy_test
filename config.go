@@ -31,16 +31,16 @@ func LoadConfig(filename string) (*Config, error) {
 
 	// Устанавливаем значения по умолчанию, если они не указаны в конфиге
 	if config.ListenAddr == "" {
-		config.ListenAddr = ":8080"
+		config.ListenAddr = ":8082"
 	}
 	if config.ProxiesFile == "" {
-		config.ProxiesFile = "proxies.json" // Изменено значение по умолчанию на proxies.json
+		config.ProxiesFile = "proxies.json"
 	}
 	if config.Timeout == 0 {
 		config.Timeout = 10
 	}
 	if config.WorkerCount == 0 {
-		config.WorkerCount = 100
+		config.WorkerCount = 2000 // Увеличено для максимальной производительности
 	}
 	if config.MetricsAddr == "" {
 		config.MetricsAddr = ":9090"
@@ -49,7 +49,7 @@ func LoadConfig(filename string) (*Config, error) {
 		config.CheckInterval = 30
 	}
 	if config.MaxIdleConns == 0 {
-		config.MaxIdleConns = 100
+		config.MaxIdleConns = 10000 // Увеличено для максимальной производительности
 	}
 
 	return &config, nil
